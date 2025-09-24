@@ -29,6 +29,7 @@
 #import <ImageIO/CGImageDestination.h>
 #import <MobileCoreServices/UTCoreTypes.h>
 #import <objc/message.h>
+#import <PhotosUI/PhotosUI.h>
 
 #ifndef __CORDOVA_4_0_0
     #import <Cordova/NSData+Base64.h>
@@ -192,28 +193,28 @@ static NSString* toBase64(NSData* data) {
 
         cameraPicker.delegate = self;
         cameraPicker.callbackId = callbackId;
-        // we need to capture this state for memory warnings that dealloc this object
         cameraPicker.webView = self.webView;
 
-        // If a popover is already open, close it; we only want one at a time.
-        if (([[self pickerController] pickerPopoverController] != nil) && [[[self pickerController] pickerPopoverController] isPopoverVisible]) {
-            [[[self pickerController] pickerPopoverController] dismissPopoverAnimated:YES];
-            [[[self pickerController] pickerPopoverController] setDelegate:nil];
-            [[self pickerController] setPickerPopoverController:nil];
-        }
-
-        if ([self popoverSupported] && (pictureOptions.sourceType != UIImagePickerControllerSourceTypeCamera)) {
-            if (cameraPicker.pickerPopoverController == nil) {
-                cameraPicker.pickerPopoverController = [[NSClassFromString(@"UIPopoverController") alloc] initWithContentViewController:cameraPicker];
-            }
-            [self displayPopover:pictureOptions.popoverOptions];
-            self.hasPendingOperation = NO;
-        } else {
-            cameraPicker.modalPresentationStyle = UIModalPresentationCurrentContext;
-            [self.viewController presentViewController:cameraPicker animated:YES completion:^{
+        // PhotoLibrary/SavedPhotosAlbumはPHPickerViewControllerを使う
+        if (pictureOptions.sourceType == UIImagePickerControllerSourceTypePhotoLibrary || pictureOptions.sourceType == UIImagePickerControllerSourceTypeSavedPhotosAlbum) {
+            cameraPicker.usePhotoPicker = YES;
+            PHPickerConfiguration *config = [[PHPickerConfiguration alloc] init];
+            config.selectionLimit = 1;
+            config.filter = (pictureOptions.mediaType == MediaTypeVideo) ? [PHPickerFilter videosFilter] : [PHPickerFilter imagesFilter];
+            PHPickerViewController *phPicker = [[PHPickerViewController alloc] initWithConfiguration:config];
+            phPicker.delegate = cameraPicker;
+            cameraPicker.phPickerController = phPicker;
+            cameraPicker.phPickerCompletion = ^(NSDictionary* info) {
+                [self imagePickerController:cameraPicker didFinishPickingMediaWithInfo:info];
+            };
+            [self.viewController presentViewController:phPicker animated:YES completion:^{
                 self.hasPendingOperation = NO;
             }];
+            return;
         }
+
+        // ...existing code...
+    cameraPicker.usePhotoPicker = (pictureOptions.sourceType == UIImagePickerControllerSourceTypePhotoLibrary || pictureOptions.sourceType == UIImagePickerControllerSourceTypeSavedPhotosAlbum);
     });
 }
 
@@ -505,7 +506,28 @@ static NSString* toBase64(NSData* data) {
         __block CDVPluginResult* result = nil;
 
         NSString* mediaType = [info objectForKey:UIImagePickerControllerMediaType];
-        if ([mediaType isEqualToString:(NSString*)kUTTypeImage]) {
+        // usePhotoPicker=true の場合は mediaType が無い場合もある
+        BOOL isPhotoPicker = cameraPicker.usePhotoPicker;
+        if (isPhotoPicker) {
+            if ([info objectForKey:UIImagePickerControllerOriginalImage]) {
+                [weakSelf resultForImage:cameraPicker.pictureOptions info:info completion:^(CDVPluginResult* res) {
+                    [weakSelf.commandDelegate sendPluginResult:res callbackId:cameraPicker.callbackId];
+                    weakSelf.hasPendingOperation = NO;
+                    weakSelf.pickerController = nil;
+                }];
+            } else if ([info objectForKey:UIImagePickerControllerMediaURL]) {
+                result = [weakSelf resultForVideo:info];
+                [weakSelf.commandDelegate sendPluginResult:result callbackId:cameraPicker.callbackId];
+                weakSelf.hasPendingOperation = NO;
+                weakSelf.pickerController = nil;
+            } else {
+                // キャンセル
+                result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"No Image Selected"];
+                [weakSelf.commandDelegate sendPluginResult:result callbackId:cameraPicker.callbackId];
+                weakSelf.hasPendingOperation = NO;
+                weakSelf.pickerController = nil;
+            }
+        } else if ([mediaType isEqualToString:(NSString*)kUTTypeImage]) {
             [weakSelf resultForImage:cameraPicker.pictureOptions info:info completion:^(CDVPluginResult* res) {
                 if (![self usesGeolocation] || picker.sourceType != UIImagePickerControllerSourceTypeCamera) {
                     [weakSelf.commandDelegate sendPluginResult:res callbackId:cameraPicker.callbackId];
@@ -513,8 +535,7 @@ static NSString* toBase64(NSData* data) {
                     weakSelf.pickerController = nil;
                 }
             }];
-        }
-        else {
+        } else {
             result = [weakSelf resultForVideo:info];
             [weakSelf.commandDelegate sendPluginResult:result callbackId:cameraPicker.callbackId];
             weakSelf.hasPendingOperation = NO;
@@ -704,6 +725,48 @@ static NSString* toBase64(NSData* data) {
 @end
 
 @implementation CDVCameraPicker
+
+#pragma mark - PHPickerViewControllerDelegate
+
+- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
+    self.phPickerResults = results;
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    if (results.count > 0) {
+        PHPickerResult *result = results[0];
+        if ([result.itemProvider canLoadObjectOfClass:[UIImage class]]) {
+            [result.itemProvider loadObjectOfClass:[UIImage class] completionHandler:^(id object, NSError *error) {
+                if (object && [object isKindOfClass:[UIImage class]]) {
+                    self.selectedImage = (UIImage *)object;
+                    if (self.phPickerCompletion) {
+                        NSDictionary *info = @{ UIImagePickerControllerOriginalImage: self.selectedImage };
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            self.phPickerCompletion(info);
+                        });
+                    }
+                }
+            }];
+        } else if ([result.itemProvider hasItemConformingToTypeIdentifier:(NSString *)kUTTypeMovie]) {
+            [result.itemProvider loadFileRepresentationForTypeIdentifier:(NSString *)kUTTypeMovie completionHandler:^(NSURL *url, NSError *error) {
+                if (url) {
+                    self.selectedVideoURL = url;
+                    if (self.phPickerCompletion) {
+                        NSDictionary *info = @{ UIImagePickerControllerMediaURL: url };
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            self.phPickerCompletion(info);
+                        });
+                    }
+                }
+            }];
+        }
+    } else {
+        // キャンセル時
+        if (self.phPickerCompletion) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.phPickerCompletion(@{});
+            });
+        }
+    }
+}
 
 - (BOOL)prefersStatusBarHidden
 {

@@ -22,6 +22,8 @@
 #import <CoreLocation/CLLocationManager.h>
 #import <Cordova/CDVPlugin.h>
 
+#import <PhotosUI/PhotosUI.h>
+
 enum CDVDestinationType {
     DestinationTypeDataUrl = 0,
     DestinationTypeFileUri
@@ -63,7 +65,13 @@ typedef NSUInteger CDVMediaType;
 
 @end
 
-@interface CDVCameraPicker : UIImagePickerController
+@interface CDVCameraPicker : UIViewController <PHPickerViewControllerDelegate>
+@property (strong) PHPickerViewController* phPickerController;
+@property (strong) NSArray<PHPickerResult*>* phPickerResults;
+@property (assign) BOOL usePhotoPicker;
+@property (strong) UIImage* selectedImage;
+@property (strong) NSURL* selectedVideoURL;
+@property (copy) void (^phPickerCompletion)(NSDictionary* info);
 
 @property (strong) CDVPictureOptions* pictureOptions;
 
@@ -79,7 +87,7 @@ typedef NSUInteger CDVMediaType;
 
 // ======================================================================= //
 
-@interface CDVCamera : CDVPlugin <UIImagePickerControllerDelegate,
+@interface CDVCamera : CDVPlugin <UIImagePickerControllerDelegate, PHPickerViewControllerDelegate,
                        UINavigationControllerDelegate,
                        UIPopoverControllerDelegate,
                        CLLocationManagerDelegate>
