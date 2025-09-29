@@ -21,6 +21,7 @@
 #import <CoreLocation/CoreLocation.h>
 #import <CoreLocation/CLLocationManager.h>
 #import <Cordova/CDVPlugin.h>
+#import <PhotosUI/PhotosUI.h>
 
 #import <PhotosUI/PhotosUI.h>
 
@@ -90,7 +91,8 @@ typedef NSUInteger CDVMediaType;
 @interface CDVCamera : CDVPlugin <UIImagePickerControllerDelegate, PHPickerViewControllerDelegate,
                        UINavigationControllerDelegate,
                        UIPopoverControllerDelegate,
-                       CLLocationManagerDelegate>
+                       CLLocationManagerDelegate,
+                       PHPickerViewControllerDelegate>
 {}
 
 @property (strong) CDVCameraPicker* pickerController;
