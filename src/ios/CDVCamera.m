@@ -29,6 +29,7 @@
 #import <ImageIO/CGImageDestination.h>
 #import <MobileCoreServices/UTCoreTypes.h>
 #import <objc/message.h>
+#import <PhotosUI/PhotosUI.h>
 
 #ifndef __CORDOVA_4_0_0
     #import <Cordova/NSData+Base64.h>
@@ -93,7 +94,9 @@ static NSString* toBase64(NSData* data) {
 
 @interface CDVCamera ()
 
+@property (nonatomic, copy) NSString *callbackId;
 @property (readwrite, assign) BOOL hasPendingOperation;
+@property (nonatomic, strong) CDVPictureOptions *pictureOptions;
 
 @end
 
@@ -143,42 +146,98 @@ static NSString* toBase64(NSData* data) {
 
     [self.commandDelegate runInBackground:^{
         CDVPictureOptions* pictureOptions = [CDVPictureOptions createFromTakePictureArguments:command];
-        pictureOptions.popoverSupported = [weakSelf popoverSupported];
-        pictureOptions.usesGeolocation = [weakSelf usesGeolocation];
-        pictureOptions.cropToSize = NO;
+        // PHPickerDelegateからアクセスできるようにプロパティに保存
+        weakSelf.pictureOptions = pictureOptions;
+        
+        // 写真アルバムからの選択の場合
+        if (pictureOptions.sourceType == UIImagePickerControllerSourceTypePhotoLibrary) {
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                
+                // PHPickerViewControllerを使用 (メインスレッド)
+                PHPickerConfiguration *config = [[PHPickerConfiguration alloc] init];
+                config.selectionLimit = 1;
+                config.filter = [PHPickerFilter imagesFilter]; // 画像のみをフィルタ
+                
+                PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:config];
+                picker.delegate = weakSelf;
+                
+                // UI操作はメインスレッドで
+                [weakSelf.viewController presentViewController:picker animated:YES completion:^{
+                    weakSelf.hasPendingOperation = NO;
+                    weakSelf.callbackId = command.callbackId; // weakSelf を使用
+                }];
+            });
+            
+        } else {
+            // カメラからの撮影の場合
+            BOOL hasCamera = [UIImagePickerController isSourceTypeAvailable:pictureOptions.sourceType];
+            if (!hasCamera) {
+                NSLog(@"Camera.getPicture: source type %lu not available.", (unsigned long)pictureOptions.sourceType);
+                CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"No camera available"];
+                [weakSelf.commandDelegate sendPluginResult:result callbackId:command.callbackId];
+                return;
+            }
+            // showCameraPicker メソッドはメインスレッドで実行されるようになっています
+            [weakSelf showCameraPicker:command.callbackId withOptions:pictureOptions];
+        }
+    }];
+}
 
-        BOOL hasCamera = [UIImagePickerController isSourceTypeAvailable:pictureOptions.sourceType];
-        if (!hasCamera) {
-            NSLog(@"Camera.getPicture: source type %lu not available.", (unsigned long)pictureOptions.sourceType);
-            CDVPluginResult* result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"No camera available"];
-            [weakSelf.commandDelegate sendPluginResult:result callbackId:command.callbackId];
+#pragma mark - PHPickerViewControllerDelegate
+
+- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
+    __weak CDVCamera* weakSelf = self;
+    
+    [picker dismissViewControllerAnimated:YES completion:^{
+        
+        // ユーザーがキャンセルした場合
+        if (!results || results.count == 0) {
+            CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"No Image Selected"];
+            [weakSelf.commandDelegate sendPluginResult:pluginResult callbackId:weakSelf.callbackId];
+            weakSelf.callbackId = nil;
             return;
         }
 
-        // Validate the app has permission to access the camera
-        if (pictureOptions.sourceType == UIImagePickerControllerSourceTypeCamera) {
-            [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(BOOL granted)
-             {
-                 if(!granted)
-                 {
-                     // Denied; show an alert
-                     dispatch_async(dispatch_get_main_queue(), ^{
-                         UIAlertController *alertController = [UIAlertController alertControllerWithTitle:[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleDisplayName"] message:NSLocalizedString(@"Access to the camera has been prohibited; please enable it in the Settings app to continue.", nil) preferredStyle:UIAlertControllerStyleAlert];
-                         [alertController addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", nil) style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                             [weakSelf sendNoPermissionResult:command.callbackId];
-                         }]];
-                         [alertController addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Settings", nil) style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                             [[UIApplication sharedApplication] openURL:[NSURL URLWithString:UIApplicationOpenSettingsURLString] options:@{} completionHandler:nil];
-                             [weakSelf sendNoPermissionResult:command.callbackId];
-                         }]];
-                         [weakSelf.viewController presentViewController:alertController animated:YES completion:nil];
-                     });
-                 } else {
-                     [weakSelf showCameraPicker:command.callbackId withOptions:pictureOptions];
-                 }
-             }];
+        PHPickerResult *result = results.firstObject;
+        
+        if ([result.itemProvider canLoadObjectOfClass:[UIImage class]]) {
+            [result.itemProvider loadObjectOfClass:[UIImage class] completionHandler:^(id<NSItemProviderReading>  _Nullable object, NSError * _Nullable error) {
+                
+                // 画像処理はバックグラウンドスレッドで続行
+                if (object && [object isKindOfClass:[UIImage class]]) {
+                    UIImage *image = (UIImage *)object;
+                    
+                    // UIImagePickerControllerDelegate の引数に合わせた info NSDictionary を作成
+                    // PHPickerはメタデータを直接提供しないため、ここでは空のディクショナリを使用
+                    NSDictionary *info = @{UIImagePickerControllerOriginalImage: image};
+                    CDVPictureOptions *options = weakSelf.pictureOptions;
+                    
+                    // 共通のヘルパーメソッド resultForImage: を使用して結果を生成
+                    [weakSelf resultForImage:options info:info completion:^(CDVPluginResult *pluginResult) {
+                        // 結果の返却のみメインスレッドで実行
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            if (pluginResult) {
+                                [weakSelf.commandDelegate sendPluginResult:pluginResult callbackId:weakSelf.callbackId];
+                                weakSelf.callbackId = nil;
+                            }
+                        });
+                    }];
+                    
+                } else {
+                    // 画像の読み込み失敗
+                    CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"画像の読み込みに失敗しました。"];
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [weakSelf.commandDelegate sendPluginResult:pluginResult callbackId:weakSelf.callbackId];
+                        weakSelf.callbackId = nil;
+                    });
+                }
+            }];
         } else {
-            [weakSelf showCameraPicker:command.callbackId withOptions:pictureOptions];
+            // UIImageとしてロードできない場合の処理
+            CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"選択されたメディアは画像ではありません。"];
+            [weakSelf.commandDelegate sendPluginResult:pluginResult callbackId:weakSelf.callbackId];
+            weakSelf.callbackId = nil;
         }
     }];
 }
@@ -192,10 +251,8 @@ static NSString* toBase64(NSData* data) {
 
         cameraPicker.delegate = self;
         cameraPicker.callbackId = callbackId;
-        // we need to capture this state for memory warnings that dealloc this object
         cameraPicker.webView = self.webView;
 
-        // If a popover is already open, close it; we only want one at a time.
         if (([[self pickerController] pickerPopoverController] != nil) && [[[self pickerController] pickerPopoverController] isPopoverVisible]) {
             [[[self pickerController] pickerPopoverController] dismissPopoverAnimated:YES];
             [[[self pickerController] pickerPopoverController] setDelegate:nil];
